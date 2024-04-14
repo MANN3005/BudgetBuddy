@@ -1,0 +1,690 @@
+---
+
+Parameters:
+  VPCId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC Idv
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: List of subnet IDs
+  SecurityGroupId:
+    Type: AWS::EC2::SecurityGroup::Id
+    Description: Security Group Id
+    
+Resources:
+  PersonalFinanceBotECR:
+    Type: AWS::ECR::Repository
+    Properties:
+      RepositoryName: "ecr-repository"
+  ChatBotRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument: 
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: 
+              Service:
+                - "lambda.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Description: "IAM Role for Lambda Function giving access to Lex Service"
+      Policies: 
+        - PolicyName: "LambdaFunctionLexAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "lex:*"
+                Resource: "*" 
+        - PolicyName: "SecretsManagerAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: "secretsmanager:GetSecretValue"
+                Resource: !Ref ChatBotSecret
+  ChatBotLambdaFunctionPermission:
+    Type: "AWS::Lambda::Permission"
+    Properties:
+      FunctionName: !Ref ChatBotLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "apigateway.amazonaws.com"
+      SourceArn: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${ChatBotAPIGatewayRestAPI}/Development/POST/send"        
+  LexInvokeLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AddTransactionLambda
+      Action: "lambda:InvokeFunction"
+      Principal: lex.amazonaws.com
+      SourceArn: !GetAtt PersonalFinanceChatBotAlias.Arn
+  AddTransactionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service:
+                - "lambda.amazonaws.com"
+                - "lex.amazonaws.com"
+            Action: "sts:AssumeRole"
+      Description: "IAM Role for Lambda Function giving access to DynamoDb Service"
+      Policies: 
+        - PolicyName: "LambdaFunctionDynamoDbAccess"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - "dynamodb:PutItem"
+                  - "dynamodb:GetItem"
+                  - "dynamodb:Query"
+                Resource: 
+                  - !GetAtt DynamoDbTable.Arn
+  ChatBotLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures: 
+        - "x86_64"
+      Code: 
+        ZipFile: |
+          import boto3
+          import json
+          def get_secret():
+            secret_name = "BotAliasId-BotId"
+            region_name = "us-east-1"
+            # Create a Secrets Manager client
+            session = boto3.session.Session()
+            client = session.client(
+                service_name='secretsmanager',
+                region_name=region_name
+            )
+            try:
+                get_secret_value_response = client.get_secret_value(
+                    SecretId=secret_name
+                )
+            except ClientError as e:
+                raise e
+            secret = get_secret_value_response['SecretString']
+            secret_dict = json.loads(secret)
+            bot_id = secret_dict['BotId'].split('|')[1]
+            bot_alias_id = secret_dict['BotId'].split('|')[0]
+
+            return bot_alias_id, bot_id
+          
+          def lambda_handler(event, context):
+            user_message = event['text']
+            bot_alias_id, bot_id = get_secret()
+            lex_client = boto3.client("lexv2-runtime")
+            response = lex_client.recognize_text(
+                botId=bot_id,
+                botAliasId=bot_alias_id,
+                localeId='en_US',
+                sessionId='mann-session',
+                text=user_message
+            )
+            if 'messages' in response:
+              messages = response['messages']
+              if messages:
+                return {
+                  "statusCode": 200,
+                  "body": messages[0]['content']
+                }
+            return {
+                "statusCode": 200,
+                "body": "I am sorry, I don't understand. Can you please tell me again?"
+            }
+      Description: "Lambda Function for the ChatBot Interaction"
+      FunctionName: "ChatBot"
+      Role: !GetAtt ChatBotRole.Arn
+      Runtime: "python3.12"
+      Handler: "index.lambda_handler"
+      Timeout: 10
+  AddTransactionLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Architectures:
+        - "x86_64"
+      Code:
+        ZipFile: |
+          import boto3
+          from datetime import datetime
+          dynamodb = boto3.client('dynamodb')
+          def lambda_handler(event, context):
+            try:
+              userId = "mann"
+              interpretation = event['interpretations'][0]
+              slots = interpretation['intent']['slots']
+              date = datetime.now().isoformat()
+              amount = slots['Amount']['value']['interpretedValue']
+              category = slots['Category']['value']['interpretedValue']
+              dynamodb.put_item(
+                  TableName='PersonalFinanceBotTable',
+                  Item={'userId': {'S': userId}, 'date': {'S': date}, 'amount': {'N': str(amount)}, 'category': {'S': category}}
+              )
+              return {
+                  "messages": [
+                  {
+                  "content": "Payment Added Successfully",
+                  "contentType": "PlainText"
+                  }
+                ],
+                "sessionState": {
+                    "dialogAction": {
+                        "type": "Close",
+                        "fulfillmentState": "Fulfilled",
+                        "message": {
+                            "contentType": "PlainText",
+                            "content": "Payment Added Successfully"
+                        }
+                    },
+                    "intent": {
+                        "name": "AddPaymentIntent",
+                        "state": "Fulfilled"
+                      }
+                  }
+                }
+            except Exception as e:
+              return {
+                "messages": [
+                  {
+                  "content": "Error Adding the Payment",
+                  "contentType": "PlainText"
+                  }
+                ],
+                "sessionState": {
+                  "dialogAction": {
+                      "type": "Close",
+                      "fulfillmentState": "Failed",
+                      "message": {
+                          "contentType": "PlainText",
+                          "content": "Failed to add payment. Please try again later."
+                      }
+                  },
+                  "intent": {
+                      "name": "AddPaymentIntent",
+                      "state": "Failed"
+                    }
+                  }
+                }
+      Description: "Lambda Function for the Add Transaction"
+      FunctionName: "AddTransaction"
+      Role: !GetAtt AddTransactionRole.Arn
+      Runtime: "python3.12"
+      Handler: "index.lambda_handler"
+      Timeout: 10 
+  DynamoDbTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions: 
+        - 
+          AttributeName: userId
+          AttributeType: "S"
+        -
+          AttributeName: date
+          AttributeType: "S"
+      KeySchema: 
+        - 
+          AttributeName: "userId"
+          KeyType: "HASH"
+        - 
+          AttributeName: "date"
+          KeyType: "RANGE"
+      ProvisionedThroughput:
+        ReadCapacityUnits: 5
+        WriteCapacityUnits: 5
+      TableName: PersonalFinanceBotTable  
+  ECSTaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: "personal-finance-bot-task-definition"
+      Cpu: 0.25 vCPU
+      Memory: 0.5 GB
+      ContainerDefinitions:
+        - Name: "personal-finance-bot-container"
+          Image: !Sub "${AWS::AccountId}.dkr.ecr.${AWS::Region}.amazonaws.com/ecr-repository:latest"
+          PortMappings:
+            - ContainerPort: 80
+              HostPort: 80
+          Essential: true
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/personal-finance-bot-task-definition
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: ecs
+          Environment:
+            - Name: API_URL
+              Value: !Ref ChatBotAPIGatewayRestAPI
+      RequiresCompatibilities:
+           - FARGATE
+      NetworkMode: awsvpc
+      ExecutionRoleArn: !GetAtt "ecsTaskExecutionRole.Arn"   
+  ecsTaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: ecsTaskExecutionRolePolicy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action:
+                  - logs:CreateLogStream
+                  - logs:PutLogEvents
+                Resource: "arn:aws:logs:*:*:*"
+              - Effect: Allow
+                Action:
+                  - ecs:CreateCluster
+                  - ecs:DeregisterContainerInstance
+                  - ecs:DiscoverPollEndpoint
+                  - ecs:Poll
+                  - ecs:RegisterContainerInstance
+                  - ecs:StartTelemetrySession
+                  - ecs:Submit*
+                Resource: "*"
+              - Effect: Allow
+                Action:
+                  - ecr:GetAuthorizationToken
+                  - ecr:BatchCheckLayerAvailability
+                  - ecr:GetDownloadUrlForLayer
+                  - ecr:BatchGetImage
+                Resource: "*"
+  ECSService: 
+    Type: AWS::ECS::Service
+    Properties: 
+      Cluster: !Ref ECSCluster
+      DesiredCount: 1
+      TaskDefinition: !Ref ECSTaskDefinition
+      LaunchType: FARGATE
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          Subnets:
+            - !Select [0, !Ref SubnetIds]
+            - !Select [1, !Ref SubnetIds]
+          SecurityGroups:
+            - !Ref SecurityGroupId
+          AssignPublicIp: ENABLED
+  ECSCluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: PersonalFinanceChatBotCluster
+      CapacityProviders:
+        - FARGATE
+  LexBotRole:
+    Type: "AWS::IAM::Role"
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Service:
+                - "lex.amazonaws.com"
+            Action:
+              - "sts:AssumeRole"
+      Policies:
+        - PolicyName: "LexBotPolicy"
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "logs:CreateLogGroup"
+                  - "logs:CreateLogStream"
+                  - "logs:PutLogEvents"
+                Resource: "*"
+              - Effect: "Allow"
+                Action:
+                  - "lambda:InvokeFunction"
+                Resource: 
+                  - !GetAtt AddTransactionLambda.Arn
+  PersonalFinanceChatBot:
+    Type: AWS::Lex::Bot
+    Properties:
+      Description: "This is a Bot which will help in Personal Finance."
+      Name: "PersonalFinanceBot"
+      RoleArn: !GetAtt LexBotRole.Arn
+      DataPrivacy:
+        ChildDirected: false
+      IdleSessionTTLInSeconds: 300
+      AutoBuildBotLocales: false
+      BotLocales:
+        - LocaleId: "en_US"
+          NluConfidenceThreshold: 0.40
+          Description: "English Bot Locale"
+          VoiceSettings:
+            VoiceId: "Ivy"
+          SlotTypes:
+            - Name: Category
+              Description: "Slot Type for the Category of the Transaction"
+              SlotTypeValues:
+                - SampleValue: 
+                    Value: Entertainment
+                  Synonyms:
+                    - Value:  Movies
+                    - Value:  Concert
+                    - Value: Football
+                    - Value: Soccer
+                    - Value: Netflix
+                    - Value: Roku
+                    - Value: IPTV
+                    - Value: PlayStation
+                    - Value: Video Game
+                    - Value: Entertainment
+                - SampleValue: 
+                    Value: Utilities
+                  Synonyms:
+                    - Value: Electricity
+                    - Value: Water
+                    - Value: Gas
+                    - Value: Wi-Fi
+                    - Value: Heat
+                    - Value: Phone Bill
+                    - Value: Diesel
+                    - Value: Utilities
+                - SampleValue:
+                    Value: Grocery
+                  Synonyms:
+                       - Value: Tomatoes
+                       - Value: Onion
+                       - Value: Bread
+                       - Value: Eggs
+                       - Value: Butter
+                       - Value: Roti
+                       - Value: Tortillas
+                       - Value: Atlantic Superstore 
+                       - Value: Indian Groceries
+                       - Value: Walmart
+                       - Value: Sobeys
+                       - Value: Grocery
+                - SampleValue:
+                       Value: Transportation
+                  Synonyms:
+                       - Value: Bus Pass
+                       - Value: Car 
+                       - Value: Car Rental
+                       - Value: Uber
+                       - Value: Parking Fee
+                       - Value: Communo-Auto
+                       - Value: Transportation
+                - SampleValue:
+                       Value: Dining
+                  Synonyms:
+                       - Value: Pizza
+                       - Value: Food
+                       - Value: Tim Hortons
+                       - Value: Dining
+                       - Value: Indian Food
+                       - Value: Tawa Grill
+                       - Value: Coffee
+                       - Value: Burger
+                       - Value: Bar
+                       - Value: Beer
+                - SampleValue:
+                       Value: Others
+                  Synonyms:
+                       - Value: Others
+                       - Value: Miscellaneous 
+                       - Value: Unknown
+              ValueSelectionSetting:
+                ResolutionStrategy: TOP_RESOLUTION
+          Intents:
+            - Name: "CategoryInfoIntent"
+              Description: "This is the Intent which will help in the Explanation of the various types of category this bot will understand."
+              SampleUtterances:
+                - Utterance: What categories i can add?
+                - Utterance: What are the transaction categories ?
+                - Utterance: Which categories do you accept?
+                - Utterance: Why my transaction category is not accepted?
+                - Utterance: What is a category?
+              FulfillmentCodeHook:
+                Enabled: true
+              InitialResponseSetting:
+                InitialResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "Of course! Here are the categories you can use for your transactions:  Dining: Includes expenses related to eating out or ordering food. Transportation: Covers costs related to commuting or traveling. Utilities: Includes electricity, water, gas, and internet bills. Entertainment: Covers expenses related to leisure activities or entertainment. Grocery: Includes expenses related to grocery shopping. Others: For any expenses that do not fit into the above categories."
+            - Name: "AddPaymentIntent"
+              Description: "This is the Intent which will help in Adding payment to the DynamoDb Table while figuring out the amount and the Category."
+              SampleUtterances:
+                - Utterance: Add my  expense of {Amount} for {Category}
+                - Utterance: I spent {Amount} on  {Category}
+                - Utterance: Add expense of {Amount} rs
+                - Utterance: Please add {Amount} as my expense
+                - Utterance: I spent {Amount} on Pizza
+                - Utterance: I brought something
+              SlotPriorities:
+                - Priority: 1
+                  SlotName: Amount
+                - Priority: 2
+                  SlotName: Category
+              Slots:
+                - Name: Amount
+                  Description: The Slot Type of the Intent which will figure out the Amount Spent.
+                  SlotTypeName: AMAZON.Number
+                  ValueElicitationSetting:
+                    SlotConstraint: Required
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: How much money did you spent?
+                      MaxRetries: 3
+                      AllowInterrupt: false
+                - Name: Category
+                  Description: The Slot Type of the Intent which will figure out on what the Amount was spent.
+                  SlotTypeName: Category
+                  ValueElicitationSetting:
+                    SlotConstraint: Required
+                    PromptSpecification:
+                      MessageGroupsList:
+                        - Message:
+                            PlainTextMessage:
+                              Value: What did you spend money on ? (If you want to add expense other than the default categories please add as a  miscellaneous transaction.                  
+                      MaxRetries: 3
+                      AllowInterrupt: false
+              IntentConfirmationSetting:
+                PromptSpecification:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: Should i add the {Amount} for {Category} ?
+                  MaxRetries: 3
+                  AllowInterrupt: false
+                DeclinationResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "Okay. I have deleted the expense, go ahead and add a new expense." 
+                  AllowInterrupt: false
+              FulfillmentCodeHook:
+                   Enabled: true
+            - Name: "PraisingIntent"
+              Description: "This is the Intent which will help in the replying any Compliments user gives."
+              SampleUtterances:
+                - Utterance: Thank you
+                - Utterance: You are really good 
+                - Utterance: This was nice 
+                - Utterance: Thank you for helping me
+                - Utterance: This is cool
+              InitialResponseSetting:
+                InitialResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "Thank you, i am built to help you. If you have anything you need help with please tell me."
+            - Name: "GetBotInformation"
+              Description: "This is the Intent which will help in retrieving the Information about the Bot."
+              SampleUtterances:
+                - Utterance: What do you do?
+                - Utterance: What are your functions ?
+                - Utterance: what is your use?
+                - Utterance: how do you work?
+                - Utterance: Explain your working 
+                - Utterance: Who made you ?
+                - Utterance: What's your name?
+                - Utterance: What category of bot you are? 
+              InitialResponseSetting:
+                InitialResponse:
+                  MessageGroupsList:
+                     - Message:
+                         PlainTextMessage:
+                           Value: "I'm PersonalFinanceBot, and my main function is to help you track your expenses and manage your budget. You can use me to record your transactions, categorize expenses, set budget goals, and analyze your spending patterns. Whether you input your transactions manually or automatically through linked accounts, I categorize them and provide you with summaries and reports. I was created by Mann Patel and specialize in expense tracking and budgeting."
+            - Name: "GreetingsIntent"
+              Description: "This is the Intent for Initial Greetings with the Bot."
+              SampleUtterances:
+                - Utterance: Hey
+                - Utterance: Hello
+                - Utterance: Hi
+                - Utterance: Good Morning
+                - Utterance: Good Afternoon
+              InitialResponseSetting:
+                InitialResponse:
+                  MessageGroupsList:
+                    - Message:
+                        PlainTextMessage:
+                          Value: "Hey, how may i help you today?"
+            - Name: "FallbackIntent"
+              Description: "Default intent when no other intent matches"
+              ParentIntentSignature: "AMAZON.FallbackIntent"
+  PersonalFinanceChatBotVersion:
+    Type: AWS::Lex::BotVersion
+    Properties:
+      BotId: !Ref PersonalFinanceChatBot
+      BotVersionLocaleSpecification:
+        - LocaleId: en_US
+          BotVersionLocaleDetails:
+               SourceBotVersion: DRAFT
+      Description: "The Deployment Version of the Bot"
+  PersonalFinanceChatBotAlias:
+    DependsOn: PersonalFinanceChatBotVersion
+    Type: AWS::Lex::BotAlias
+    Properties:
+      BotVersion: 1
+      BotId: !Ref PersonalFinanceChatBot
+      BotAliasName: PersonalFinanceChatBotAlias
+      Description: The Alias used for the Bot
+      BotAliasLocaleSettings:
+        - LocaleId: en_US
+          BotAliasLocaleSetting:
+            Enabled: true
+            CodeHookSpecification:
+              LambdaCodeHook:
+                CodeHookInterfaceVersion: 1.0
+                LambdaArn: !GetAtt AddTransactionLambda.Arn
+      SentimentAnalysisSettings:
+           DetectSentiment: false
+  ChatBotAPIGatewayRestAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Description: "Rest Api for sending message from Front-End to ChatBot-Lambda"
+      Name: "SendMessageToBot"
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+  ChatBotAPIGatewayResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      ParentId: !GetAtt
+        - "ChatBotAPIGatewayRestAPI"
+        - "RootResourceId"
+      PathPart: send
+      RestApiId: !Ref ChatBotAPIGatewayRestAPI
+  ChatBotAPIGatewayMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      HttpMethod: POST
+      ResourceId: !Ref ChatBotAPIGatewayResource
+      RestApiId: !Ref ChatBotAPIGatewayRestAPI
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS
+        IntegrationHttpMethod: POST
+        Uri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${ChatBotLambda.Arn}/invocations
+        PassthroughBehavior: WHEN_NO_MATCH
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+            ResponseTemplates:
+              application/json: ""
+      MethodResponses:
+          - StatusCode: 200
+            ResponseModels:
+              application/json: "Empty"
+            ResponseParameters:
+                 "method.response.header.Access-Control-Allow-Origin": true
+  ApiGatewayOPTIONSMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref ChatBotAPIGatewayRestAPI
+      ResourceId: !Ref ChatBotAPIGatewayResource
+      HttpMethod: 'OPTIONS'
+      AuthorizationType: 'NONE'
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,PUT,DELETE,OPTIONS'"
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+        PassthroughBehavior: WHEN_NO_MATCH    
+        RequestTemplates:
+          application/json: '{"statusCode":200}'   
+      MethodResponses:
+        - StatusCode: 200
+          ResponseModels:
+            application/json: "Empty"
+          ResponseParameters:
+            "method.response.header.Access-Control-Allow-Headers": true
+            "method.response.header.Access-Control-Allow-Methods": true
+            "method.response.header.Access-Control-Allow-Origin": true
+  ChatBotAPIGatewayDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: ChatBotAPIGatewayMethod
+    Properties:
+      RestApiId: !Ref ChatBotAPIGatewayRestAPI
+      Description: "Deployment for the ChatBotAPIGatewayRestAPI"
+  ChatBotAPIGatewayStage:
+    Type: AWS::ApiGateway::Stage
+    Properties:
+      DeploymentId: !Ref ChatBotAPIGatewayDeployment
+      Description: "Development Stage for my ChatBot API"
+      RestApiId: !Ref ChatBotAPIGatewayRestAPI
+      StageName: Development
+  ChatBotSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: "My Bot Id Secret"
+      Name: BotAliasId-BotId
+      SecretString: !Sub
+        - '{"BotId": "${Arn}"}'
+        - Arn: !Ref PersonalFinanceChatBotAlias
+  RESTApiSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Description: "My RESTApi Secret"
+      Name: ApiId
+      SecretString: !Sub
+        - '{"ApiId": "${Arn}"}'
+        - Arn: !Ref ChatBotAPIGatewayRestAPI
+
+Outputs:
+  ChatBotAPIGatewayRestAPIId:
+    Value: !Ref ChatBotAPIGatewayRestAPI
+    Export:
+      Name: "ChatBotAPIGatewayRestAPI"
+
+
+  
